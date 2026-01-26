@@ -37,8 +37,15 @@
 
 using namespace std::chrono_literals;  
 
-// 串口设备文件
-#define SERIAL_PORT "/dev/ttyCH9344USB1"
+// 参数默认值
+static const char *kDefaultSerialPort = "/dev/ttyCH9344USB1";
+static constexpr double kDefaultWarnTimeout = 0.25;
+static constexpr double kDefaultMaxTimeout = 1.0;
+
+// 全局可配置参数（由节点参数覆盖）
+std::string g_serial_port = kDefaultSerialPort;
+double g_warn_timeout = kDefaultWarnTimeout;
+double g_max_timeout = kDefaultMaxTimeout;
 
 int fd = -1;
 
@@ -98,7 +105,7 @@ int uart_init()
 {
 	// 打开串口
 	int status = 1;
-	fd = open(SERIAL_PORT, O_RDWR | O_NOCTTY);
+	fd = open(g_serial_port.c_str(), O_RDWR | O_NOCTTY);
 	if (fd == -1)
 	{
 		perror("Error opening serial port");
@@ -232,7 +239,19 @@ public:
   OdomeListener()  
   : Node("mid360_link")  
   {  
-    pubOdomAftMapped = this->create_subscription<nav_msgs::msg::Odometry>("/Odometry", 1000, std::bind(&OdomeListener::odomecallback, this, std::placeholders::_1));
+	std::string odom_topic;
+
+	this->declare_parameter<std::string>("odometry_topic", "/odin1/odometry");
+	this->declare_parameter<std::string>("serial_port", kDefaultSerialPort);
+	this->declare_parameter<double>("warn_timeout", kDefaultWarnTimeout);
+	this->declare_parameter<double>("max_timeout", kDefaultMaxTimeout);
+
+	this->get_parameter("odometry_topic", odom_topic);
+	this->get_parameter("serial_port", g_serial_port);
+	this->get_parameter("warn_timeout", g_warn_timeout);
+	this->get_parameter("max_timeout", g_max_timeout);
+
+	pubOdomAftMapped = this->create_subscription<nav_msgs::msg::Odometry>(odom_topic, 1000, std::bind(&OdomeListener::odomecallback, this, std::placeholders::_1));
 
   }  
 private:  
@@ -241,6 +260,13 @@ private:
 	header_time = rclcpp::Time(msg->header.stamp).seconds();
 	now_time = this->get_clock()->now().seconds();
 
+	double warn_timeout = g_warn_timeout;
+	double max_timeout = g_max_timeout;
+	if (max_timeout > 0.0 && warn_timeout > max_timeout) {
+		warn_timeout = max_timeout;
+	}
+	double time_diff = fabs(header_time - now_time);
+
 	if( last_time == 0 ){
 		last_time = now_time;
 		RCLCPP_INFO(this->get_logger(), "Pos_Link init.");
@@ -248,13 +274,13 @@ private:
 
 	}
 
-	if( fabs(header_time - now_time) > 0.25 ){
+	if( time_diff > warn_timeout ){
 		okay = false;
 		if(printf_flag==true){
-			RCLCPP_WARN(this->get_logger(), "TimeStamp error,now time is: %f, but pointcloud2 time is: %f",now_time,last_time);
+			RCLCPP_WARN(this->get_logger(), "TimeStamp error,now time is: %f, but pointcloud2 time is: %f",now_time,header_time);
 			printf_flag = false;
 		}
-		if( fabs(header_time - now_time) <= 1.0 ){
+		if( time_diff <= max_timeout ){
 			send_uart( 3, msg->pose.pose.position.x * 100, msg->pose.pose.position.y * 100, msg->pose.pose.position.z * 100, msg->pose.pose.orientation.x, msg->pose.pose.orientation.y, msg->pose.pose.orientation.z, msg->pose.pose.orientation.w );
 		}else{
 			send_uart( 0, msg->pose.pose.position.x * 100, msg->pose.pose.position.y * 100, msg->pose.pose.position.z * 100, msg->pose.pose.orientation.x, msg->pose.pose.orientation.y, msg->pose.pose.orientation.z, msg->pose.pose.orientation.w );
@@ -288,6 +314,14 @@ public:
 LCTask()  
   : Node("mid360_link_lc")  
   {  
+	this->declare_parameter<std::string>("serial_port", kDefaultSerialPort);
+	this->declare_parameter<double>("warn_timeout", kDefaultWarnTimeout);
+	this->declare_parameter<double>("max_timeout", kDefaultMaxTimeout);
+
+	this->get_parameter("serial_port", g_serial_port);
+	this->get_parameter("warn_timeout", g_warn_timeout);
+	this->get_parameter("max_timeout", g_max_timeout);
+
     timer_ = this->create_wall_timer(  
 		std::chrono::milliseconds(100), std::bind(&LCTask::timer, this));  
   }  
@@ -312,7 +346,7 @@ private:
 		}
 	}
 	
-	if( task_time - now_time >= 0.5 ){
+	if( g_max_timeout > 0.0 && task_time - now_time >= g_max_timeout ){
 		if(printf_flag){
 			RCLCPP_ERROR(this->get_logger(), "Slam pose msg lost!");
 		}

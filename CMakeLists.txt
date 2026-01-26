@@ -39,8 +39,9 @@ ament_target_dependencies(
 
 install(TARGETS odometry_driver
   DESTINATION lib/${PROJECT_NAME})
-  install(
-  DIRECTORY 
+install(
+  DIRECTORY
+  config
   DESTINATION share/${PROJECT_NAME}
 )
 
