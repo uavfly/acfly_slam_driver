@@ -128,3 +128,8 @@ typedef struct poslink_msg{
     }crc16;
 
 }poslink_msg;
+
+inline double get_time_sec(const builtin_interfaces::msg::Time &time)
+{
+  return rclcpp::Time(time).seconds();
+}

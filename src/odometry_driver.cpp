@@ -35,26 +35,49 @@
 #include <nav_msgs/msg/odometry.hpp>
 #include "odometry_driver.hpp"
 
-using namespace std::chrono_literals;  
-
-// 参数默认值
-static const char *kDefaultSerialPort = "/dev/ttyCH9344USB1";
-static constexpr double kDefaultWarnTimeout = 0.25;
-static constexpr double kDefaultMaxTimeout = 1.0;
+using namespace std::chrono_literals;
 
 // 全局可配置参数（由节点参数覆盖）
-std::string g_serial_port = kDefaultSerialPort;
-double g_warn_timeout = kDefaultWarnTimeout;
-double g_max_timeout = kDefaultMaxTimeout;
+std::string serial_port = "/dev/ttyCH9344USB1";
+double warn_timeout = 0.25;
+double max_timeout = 1.0;
+double freq = 10.0;
 
 int fd = -1;
 
-double now_time, last_time, delay_time, header_time, print_time, task_time;
+double now_time = 0, last_time = 0, delay_time, header_time, print_time, task_time;
 
 bool okay = false;
 
 bool printf_flag = false;
 
+// 构造里程计数据结构体，timestamp为接收话题的时间戳,used为该数据是否已被使用
+struct Odometry_msg
+{
+	nav_msgs::msg::Odometry odometry;
+	double timestamp;
+};
+
+struct Odometry_msg odometry_msg;
+struct Odometry_msg odometry_cache;
+
+enum slam_driver_state
+{
+	SLAM_DRIVER_INIT = 0, // 初始化
+	SLAM_DRIVER_WAIT = 1, // 等待：此帧数据不发送（指定频率发送）
+	SLAM_DRIVER_OKAY = 2, // 正常
+	SLAM_DRIVER_WARN = 3, // 警告：时间戳超时（未到不可用阶段）
+	SLAM_DRIVER_ERROR = 4 // 错误：时间戳错误（严重超时，slam退化或者停止）
+};
+
+enum slam_mode
+{
+	SLAM_MODE_OFF = 0,	  // 注销slam传感器
+	SLAM_MODE_XY = 1,  // 仅水平定位
+	SLAM_MODE_XYZ = 2,  // 三维定位
+	SLAM_MODE_XYZQ = 3, // 三维定位+罗盘
+	SLAM_MODE_INIT = 4	  // 初始化/重置slam
+};
 
 // 配置串口
 int setup_serial(int fd)
@@ -105,7 +128,7 @@ int uart_init()
 {
 	// 打开串口
 	int status = 1;
-	fd = open(g_serial_port.c_str(), O_RDWR | O_NOCTTY);
+	fd = open(serial_port.c_str(), O_RDWR | O_NOCTTY);
 	if (fd == -1)
 	{
 		perror("Error opening serial port");
@@ -162,17 +185,15 @@ void crc16_modbus(uint8_t *puchMsg, unsigned int usDataLen, uint8_t *puchCRCHi, 
 	*puchCRCLo = uchCRCLo;
 }
 
-
-
-void send_uart( uint8_t id, float posx, float posy, float posz, double x, double y, double z, double w )
+void send_uart(uint8_t id, float posx, float posy, float posz, double x, double y, double z, double w)
 {
-    poslink_msg send_msg;
+	poslink_msg send_msg;
 	send_msg.msg[0] = 0xfe;
 	send_msg.msg[1] = 0xfb;
 	send_msg.msg[2] = id;
-	send_msg.pos_x.data = posx;
-	send_msg.pos_y.data = posy;
-	send_msg.pos_z.data = posz;
+	send_msg.pos_x.data = posx * 100;
+	send_msg.pos_y.data = posy * 100;
+	send_msg.pos_z.data = posz * 100;
 	send_msg.q_x.data = x;
 	send_msg.q_y.data = y;
 	send_msg.q_z.data = z;
@@ -223,140 +244,215 @@ void send_uart( uint8_t id, float posx, float posy, float posz, double x, double
 	send_msg.msg[45] = send_msg.q_w.bytes[1];
 	send_msg.msg[46] = send_msg.q_w.bytes[0];
 
-	crc16_modbus(send_msg.msg,47,&send_msg.crc16.bytes[0],&send_msg.crc16.bytes[1]);
+	crc16_modbus(send_msg.msg, 47, &send_msg.crc16.bytes[0], &send_msg.crc16.bytes[1]);
 
 	send_msg.msg[47] = send_msg.crc16.bytes[1];
 	send_msg.msg[48] = send_msg.crc16.bytes[0];
 
-	send_data(fd,send_msg.msg,49);
+	send_data(fd, send_msg.msg, 49);
 }
 
-//rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomAftMapped = nh->create_publisher<nav_msgs::msg::Odometry>("/body_to_init", 1000);
+// rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomAftMapped = nh->create_publisher<nav_msgs::msg::Odometry>("/body_to_init", 1000);
 
-class OdomeListener : public rclcpp::Node  
-{  
-public:  
-  OdomeListener()  
-  : Node("mid360_link")  
-  {  
-	std::string odom_topic;
-
-	this->declare_parameter<std::string>("odometry_topic", "/odin1/odometry");
-	this->declare_parameter<std::string>("serial_port", kDefaultSerialPort);
-	this->declare_parameter<double>("warn_timeout", kDefaultWarnTimeout);
-	this->declare_parameter<double>("max_timeout", kDefaultMaxTimeout);
-
-	this->get_parameter("odometry_topic", odom_topic);
-	this->get_parameter("serial_port", g_serial_port);
-	this->get_parameter("warn_timeout", g_warn_timeout);
-	this->get_parameter("max_timeout", g_max_timeout);
-
-	pubOdomAftMapped = this->create_subscription<nav_msgs::msg::Odometry>(odom_topic, 1000, std::bind(&OdomeListener::odomecallback, this, std::placeholders::_1));
-
-  }  
-private:  
-  void odomecallback(const nav_msgs::msg::Odometry::SharedPtr msg)  
-  {  
-	header_time = rclcpp::Time(msg->header.stamp).seconds();
-	now_time = this->get_clock()->now().seconds();
-
-	double warn_timeout = g_warn_timeout;
-	double max_timeout = g_max_timeout;
-	if (max_timeout > 0.0 && warn_timeout > max_timeout) {
-		warn_timeout = max_timeout;
-	}
-	double time_diff = fabs(header_time - now_time);
-
-	if( last_time == 0 ){
-		last_time = now_time;
-		RCLCPP_INFO(this->get_logger(), "Pos_Link init.");
-		send_uart( 0, msg->pose.pose.position.x * 100, msg->pose.pose.position.y * 100, msg->pose.pose.position.z * 100, msg->pose.pose.orientation.x, msg->pose.pose.orientation.y, msg->pose.pose.orientation.z, msg->pose.pose.orientation.w );
-
+class OdomeListener : public rclcpp::Node
+{
+public:
+	OdomeListener()
+		: Node("mid360_link")
+	{
+		std::string odom_topic;
+		this->declare_parameter<std::string>("odometry_topic", "/odin1/odometry");
+		this->get_parameter("odometry_topic", odom_topic);
+		pubOdomAftMapped = this->create_subscription<nav_msgs::msg::Odometry>(odom_topic, 1000, std::bind(&OdomeListener::odomecallback, this, std::placeholders::_1));
 	}
 
-	if( time_diff > warn_timeout ){
-		okay = false;
-		if(printf_flag==true){
-			RCLCPP_WARN(this->get_logger(), "TimeStamp error,now time is: %f, but pointcloud2 time is: %f",now_time,header_time);
-			printf_flag = false;
-		}
-		if( time_diff <= max_timeout ){
-			send_uart( 3, msg->pose.pose.position.x * 100, msg->pose.pose.position.y * 100, msg->pose.pose.position.z * 100, msg->pose.pose.orientation.x, msg->pose.pose.orientation.y, msg->pose.pose.orientation.z, msg->pose.pose.orientation.w );
-		}else{
-			send_uart( 0, msg->pose.pose.position.x * 100, msg->pose.pose.position.y * 100, msg->pose.pose.position.z * 100, msg->pose.pose.orientation.x, msg->pose.pose.orientation.y, msg->pose.pose.orientation.z, msg->pose.pose.orientation.w );
-			okay = false;
-		}
-	}else{
-		if( !okay ){
-			send_uart( 4, msg->pose.pose.position.x * 100, msg->pose.pose.position.y * 100, msg->pose.pose.position.z * 100, msg->pose.pose.orientation.x, msg->pose.pose.orientation.y, msg->pose.pose.orientation.z, msg->pose.pose.orientation.w );
-			RCLCPP_INFO(this->get_logger(), "Reset slam mag.");
-			okay = true;
-		}
-		delay_time = now_time - last_time;
-		last_time = now_time;
-		if(printf_flag==true){
-			RCLCPP_INFO(this->get_logger(), "Hz:%d,x:%f,y:%f,z:%f",(int)(1/delay_time),msg->pose.pose.position.x * 100, msg->pose.pose.position.y * 100, msg->pose.pose.position.z * 100);
-			printf_flag = false;
-		}
-		send_uart( 3, msg->pose.pose.position.x * 100, msg->pose.pose.position.y * 100, msg->pose.pose.position.z * 100, msg->pose.pose.orientation.x, msg->pose.pose.orientation.y, msg->pose.pose.orientation.z, msg->pose.pose.orientation.w );
+private:
+	void odomecallback(const nav_msgs::msg::Odometry::SharedPtr msg)
+	{
+		header_time = rclcpp::Time(msg->header.stamp).seconds();
+		now_time = this->get_clock()->now().seconds();
+
+		odometry_msg.odometry = *msg;
+		odometry_msg.timestamp = header_time;
 	}
 
-    // RCLCPP_INFO(this->get_logger(), "Received odometry data");
-    // You can access the data in msg and do something with it
-  }
+	rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr pubOdomAftMapped;
+};
 
-  rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr pubOdomAftMapped; 
-};  
-
-class LCTask : public rclcpp::Node  
-{  
-public:  
-LCTask()  
-  : Node("mid360_link_lc")  
-  {  
-	this->declare_parameter<std::string>("serial_port", kDefaultSerialPort);
-	this->declare_parameter<double>("warn_timeout", kDefaultWarnTimeout);
-	this->declare_parameter<double>("max_timeout", kDefaultMaxTimeout);
-
-	this->get_parameter("serial_port", g_serial_port);
-	this->get_parameter("warn_timeout", g_warn_timeout);
-	this->get_parameter("max_timeout", g_max_timeout);
-
-    timer_ = this->create_wall_timer(  
-		std::chrono::milliseconds(100), std::bind(&LCTask::timer, this));  
-  }  
-private:  
-  void timer()  
-  {  
-	task_time = this->get_clock()->now().seconds();
-
-	if(task_time - print_time >= 1.0){
-		print_time = task_time;
-		printf_flag = true;
+class LCTask : public rclcpp::Node
+{
+public:
+	LCTask()
+		: Node("mid360_link_lc")
+	{
+		timer_ = this->create_wall_timer(
+			std::chrono::milliseconds(100), std::bind(&LCTask::timer, this));
 	}
 
-	if( fd == -1 ){
-		uart_init();
-		if(printf_flag){
-			if( fd != -1){
-				RCLCPP_INFO(this->get_logger(), "Serial port restart open.");
-			}else{
-				RCLCPP_ERROR(this->get_logger(), "Serial port open failed.");
+private:
+	void timer()
+	{
+		task_time = this->get_clock()->now().seconds();
+
+		if (task_time - print_time >= 1.0)
+		{
+			print_time = task_time;
+			printf_flag = true;
+		}
+
+		if (fd == -1)
+		{
+			uart_init();
+			if (printf_flag)
+			{
+				if (fd != -1)
+				{
+					RCLCPP_INFO(this->get_logger(), "Serial port restart open.");
+				}
+				else
+				{
+					RCLCPP_ERROR(this->get_logger(), "Serial port open failed.");
+				}
 			}
 		}
 	}
-	
-	if( g_max_timeout > 0.0 && task_time - now_time >= g_max_timeout ){
-		if(printf_flag){
-			RCLCPP_ERROR(this->get_logger(), "Slam pose msg lost!");
-		}
-		printf_flag = false;
-		okay = false;
-	}
-  }
 
-  rclcpp::TimerBase::SharedPtr timer_;  
-};  
+	rclcpp::TimerBase::SharedPtr timer_;
+};
+
+class push : public rclcpp::Node
+{
+public:
+	push()
+		: Node("slam_push_uart")
+	{
+		this->declare_parameter<std::string>("serial_port", serial_port);
+		this->declare_parameter<double>("warn_timeout", warn_timeout);
+		this->declare_parameter<double>("max_timeout", max_timeout);
+		this->declare_parameter<double>("freq", freq);
+
+		this->get_parameter("serial_port", serial_port);
+		this->get_parameter("warn_timeout", warn_timeout);
+		this->get_parameter("max_timeout", max_timeout);
+		this->get_parameter("freq", freq);
+
+		// 合法性检查（防小人++）
+		if(freq <= 0){
+			freq = 10.0;
+		}
+
+		timer_ = this->create_wall_timer(
+			std::chrono::milliseconds(1), std::bind(&push::timer, this));
+	}
+
+private:
+	void timer()
+	{
+		now_time = this->get_clock()->now().seconds();
+
+		// 此帧数据已处理
+		if (odometry_cache.timestamp == odometry_msg.timestamp)
+		{
+			now_slam_state = slam_driver_state::SLAM_DRIVER_WAIT;
+			return;
+		}
+
+		// 初始化状态检测（丢弃首帧数据）
+		if ( last_time == 0.0 )
+		{
+			last_time = now_time;
+			now_slam_state = slam_driver_state::SLAM_DRIVER_INIT;
+			return;
+		}else{
+			if(now_slam_state!=slam_driver_state::SLAM_DRIVER_INIT)
+				now_slam_state = slam_driver_state::SLAM_DRIVER_OKAY;
+		}
+
+		// 串口发送频率限制
+		if ((now_time - last_time) < (1.0 / freq))
+		{
+			return;
+		}
+
+		// 防止初始化被覆盖
+		if(now_slam_state!=slam_driver_state::SLAM_DRIVER_INIT){
+			double delay_time = odometry_msg.timestamp - get_time_sec(odometry_msg.odometry.header.stamp);
+			if(delay_time > max_timeout){
+				now_slam_state = slam_driver_state::SLAM_DRIVER_ERROR;
+			}else if(delay_time > warn_timeout){
+				now_slam_state = slam_driver_state::SLAM_DRIVER_WARN;
+			}else{
+				now_slam_state = slam_driver_state::SLAM_DRIVER_OKAY;
+			}
+		}
+		// 不直接使用原始数据，防止数据竞争
+		odometry_cache = odometry_msg;
+
+		switch(now_slam_state)
+		{
+			case slam_driver_state::SLAM_DRIVER_INIT:
+			{
+				send_uart((uint8_t)slam_mode::SLAM_MODE_INIT, odometry_cache.odometry.pose.pose.position.x, odometry_cache.odometry.pose.pose.position.y, odometry_cache.odometry.pose.pose.position.z,
+						  odometry_cache.odometry.pose.pose.orientation.x, odometry_cache.odometry.pose.pose.orientation.y,
+						  odometry_cache.odometry.pose.pose.orientation.z, odometry_cache.odometry.pose.pose.orientation.w);
+				RCLCPP_INFO(this->get_logger(), "SLAM Driver Init.");
+				last_time = now_time;
+				break;
+			}
+			case slam_driver_state::SLAM_DRIVER_WAIT:
+			{
+				break;
+			}
+			case slam_driver_state::SLAM_DRIVER_OKAY:
+			{
+				send_uart((uint8_t)slam_mode::SLAM_MODE_XYZQ, odometry_cache.odometry.pose.pose.position.x, odometry_cache.odometry.pose.pose.position.y, odometry_cache.odometry.pose.pose.position.z,
+						  odometry_cache.odometry.pose.pose.orientation.x, odometry_cache.odometry.pose.pose.orientation.y,
+						  odometry_cache.odometry.pose.pose.orientation.z, odometry_cache.odometry.pose.pose.orientation.w);
+				if(now_time - last_send_time > 1.0){
+					RCLCPP_INFO(this->get_logger(), "Position x: %.3f, y: %.3f, z: %.3f", odometry_cache.odometry.pose.pose.position.x*100, odometry_cache.odometry.pose.pose.position.y*100, odometry_cache.odometry.pose.pose.position.z*100);
+					last_send_time = now_time;
+				}
+				last_time = now_time;
+				break;
+			}
+			case slam_driver_state::SLAM_DRIVER_WARN:
+			{
+				send_uart((uint8_t)slam_mode::SLAM_MODE_XYZQ, odometry_cache.odometry.pose.pose.position.x, odometry_cache.odometry.pose.pose.position.y, odometry_cache.odometry.pose.pose.position.z,
+						  odometry_cache.odometry.pose.pose.orientation.x, odometry_cache.odometry.pose.pose.orientation.y,
+						  odometry_cache.odometry.pose.pose.orientation.z, odometry_cache.odometry.pose.pose.orientation.w);
+				if(now_time - last_send_time > 1.0){
+					RCLCPP_WARN(this->get_logger(), "SLAM Driver Warning: Time delay %.3f s.", now_time - odometry_cache.timestamp);
+					last_send_time = now_time;
+				}
+				// RCLCPP_WARN(this->get_logger(), "SLAM Driver Warning: Time delay %.3f s.", now_time - odometry_cache.timestamp);
+				last_time = now_time;
+				last_send_time = now_time;
+				break;
+			}
+			case slam_driver_state::SLAM_DRIVER_ERROR:
+			{
+				send_uart((uint8_t)slam_mode::SLAM_MODE_OFF, 0, 0, 0, 0, 0, 0, 0);
+				last_time = 0;
+				last_send_time = 0;
+				break;
+			}
+			default:
+			{
+				send_uart((uint8_t)slam_mode::SLAM_MODE_OFF, 0, 0, 0, 0, 0, 0, 0);
+				last_time = 0;
+				last_send_time = 0;
+				break;
+			}
+		}
+	}
+	rclcpp::TimerBase::SharedPtr timer_;
+	double now_time = 0.0;
+	double last_time = 0.0;
+	double last_send_time = 0.0;
+	slam_driver_state now_slam_state;
+	slam_driver_state last_slam_state;
+	
+};
 
 // 处理 Ctrl+C 信号
 void signal_handler(int signal)
@@ -369,9 +465,9 @@ void signal_handler(int signal)
 		exit(0); // 强制退出程序
 	}
 }
-  
-int main(int argc, char *argv[])  
-{  
+
+int main(int argc, char *argv[])
+{
 	std::signal(SIGINT, signal_handler);
 	rclcpp::init(argc, argv);
 	uart_init();
@@ -379,9 +475,11 @@ int main(int argc, char *argv[])
 	rclcpp::executors::MultiThreadedExecutor executor;
 	auto posnode = std::make_shared<OdomeListener>();
 	auto lcnode = std::make_shared<LCTask>();
+	auto pushnode =  std::make_shared<push>();
 	executor.add_node(posnode);
 	executor.add_node(lcnode);
+	executor.add_node(pushnode);
 	executor.spin();
-	rclcpp::shutdown(); 
-	return 0; 
-} 
+	rclcpp::shutdown();
+	return 0;
+}

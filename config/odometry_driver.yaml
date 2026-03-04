@@ -1,12 +1,10 @@
 mid360_link:
   ros__parameters:
     odometry_topic: "/odin1/odometry"
-    serial_port: "/dev/ttyCH9344USB1"
-    warn_timeout: 0.5
-    max_timeout: 1.0
 
-mid360_link_lc:
+slam_push_uart:
   ros__parameters:
     serial_port: "/dev/ttyCH9344USB1"
     warn_timeout: 0.5
     max_timeout: 1.0
+    freq: 50.0
